@@ -1,0 +1,99 @@
+import jakt::path {Path}
+import jakt::platform { platform_module }
+import platform_module("jakt::platform::path") {get_path_separator}
+import extern c "sys/stat.h" {
+    extern fn mkdir(anon pathname: raw c_char, anon mode: u32) -> c_int
+}
+
+fn read_le<T>(anon data: ArraySlice<u8>) throws -> T {
+    guard data.size() == sizeof T else {
+        eprintln("{}/{}", data.size(), sizeof T)
+        throw Error::from_string_literal("Slice not big enough")
+    }
+    mut ret: T = 0
+    mut shift = 0
+
+    for i in 0..sizeof T {
+        let b = data[i]
+        ret |= (b as! T) << (shift++ * 8);
+    }
+
+    return ret
+}
+
+struct Entry {
+    name: String
+    offset: u32
+    length: u32
+}
+
+fn main(args: [String]) -> c_int {
+    guard args.size() > 1 else {
+        eprintln("Usage: {} FILE", args[0])
+        return 1
+    }
+    println("PAKRat 0.1j")
+
+    mut file = File::open_for_reading(args[1])
+    let data = file.read_all(buffer_size: 1024uz * 1024uz)
+    println("File '{}' size: {} Bytes", args[1], data.size())
+    
+    let count = read_le<u32>(data[0..4])
+    println("File contains {} entries.", count)
+
+    mut entries: [Entry] = []
+
+    mut cursor: i64 = 4;
+    for _ in 1..count {
+        let span = data[cursor..(cursor + 68)]
+        let name = String::from_utf8(span[0..64])
+        let offset = read_le<u32>(span[64..68])
+
+        let entry = Entry(name, offset, length: 0)
+        if entries.size() > 0 {
+            entries[entries.size() - 1].length = offset - entries[entries.size() - 1].offset
+        }
+
+        entries.push(entry)
+        cursor += 68
+    }
+    entries[entries.size() - 1].length = (data.size() as! u32) - entries[entries.size() - 1].offset
+
+    for entry in entries {
+        println("{:#08x} `{}` ({} Bytes)", entry.offset, entry.name, entry.length)
+    }
+
+    for entry in entries {
+        mut path = entry.name
+        // FIXME: for some reason normalization is not working.
+        if path.contains("\\") {
+            path = path.replace(replace: "\\", with: "/")
+        }
+        let unix_path = Path::from_string(path)
+        if not unix_path.parent().is_dot() {
+            mut reverse_dirs: [String] = []
+            {
+                let sep = get_path_separator()
+                let parts = unix_path.to_string().split(sep as! c_char)
+                let dirs = parts[0..(parts.size() - 1)]
+                for dir in dirs {
+                    reverse_dirs.insert(before_index: 0, value: dir)
+                }
+            }
+            mut parent = unix_path.parent()
+            for dir in reverse_dirs {
+                let path = Path::from_string(dir)
+                guard not path.exists() else {
+                    continue
+                }
+                println("Creating directory {}", path.to_string())
+                mkdir(dir.c_string(), 0o777u32)
+            }
+        }
+        println("Creating file {}", path)
+        mut ofile = File::open_for_writing(path)
+        ofile.write(data[entry.offset..(entry.offset + entry.length)])
+    }
+
+    return 0
+}
